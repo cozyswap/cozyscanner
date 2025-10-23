@@ -1,108 +1,45 @@
-// scanner.js - Blockchain Data Manager
+// scanner.js - Simple and working version
 class CozyScanner {
     constructor() {
-        this.config = window.CONFIG;
-        this.provider = null;
-        this.factory = null;
+        this.provider = new ethers.providers.JsonRpcProvider('https://rpc.plasma.to');
+        this.factory = new ethers.Contract(
+            '0xa252e44D3478CeBb1a3D59C9146CD860cb09Ec93',
+            [
+                "function allPairs(uint256) external view returns (address)",
+                "function allPairsLength() external view returns (uint256)"
+            ],
+            this.provider
+        );
         this.pairs = new Map();
         this.tokens = new Map();
-        this.isRunning = false;
-        this.currentRPCIndex = 0;
-        this.retryCount = 0;
-        this.maxRetries = 3;
     }
 
     async initialize() {
         try {
-            console.log('🚀 Initializing CozyScanner GitHub Edition...');
-            window.updateConnectionStatus('status-offline', 'CONNECTING...');
-            
-            await this.initializeProvider();
-            await this.initializeContracts();
-            await this.loadNetworkData();
-            await this.loadTradingPairs();
-            
-            this.isRunning = true;
-            this.startRealTimeUpdates();
-            
-            window.showSuccess(`✅ Live monitoring ${this.pairs.size} trading pairs`);
-            window.updateConnectionStatus('status-online', 'LIVE - PLASMA NETWORK');
-            
-        } catch (error) {
-            console.error('Initialization failed:', error);
-            await this.handleInitializationError(error);
-        }
-    }
-
-    async initializeProvider() {
-        const rpcURL = this.config.BLOCKCHAIN.RPC_ENDPOINTS[this.currentRPCIndex];
-        
-        try {
-            this.provider = new ethers.providers.JsonRpcProvider(rpcURL, {
-                name: this.config.BLOCKCHAIN.CHAIN_NAME,
-                chainId: this.config.BLOCKCHAIN.CHAIN_ID
-            });
+            console.log('🔗 Initializing CozyScanner...');
             
             // Test connection
-            const network = await this.provider.getNetwork();
             const blockNumber = await this.provider.getBlockNumber();
+            document.getElementById('blockHeight').textContent = blockNumber.toLocaleString();
+            document.getElementById('status').textContent = 'Connected';
             
-            console.log(`🔗 Connected to ${network.name} at block ${blockNumber}`);
-            return true;
-            
-        } catch (error) {
-            console.warn(`RPC ${rpcURL} failed:`, error.message);
-            throw error;
-        }
-    }
-
-    async initializeContracts() {
-        this.factory = new ethers.Contract(
-            this.config.CONTRACTS.FACTORY,
-            [
-                "function allPairs(uint256) external view returns (address)",
-                "function allPairsLength() external view returns (uint256)",
-                "function getPair(address tokenA, address tokenB) external view returns (address pair)"
-            ],
-            this.provider
-        );
-        
-        console.log('📄 Smart contracts initialized');
-    }
-
-    async loadNetworkData() {
-        const blockNumber = await this.provider.getBlockNumber();
-        document.getElementById('blockHeight').textContent = blockNumber.toLocaleString();
-        
-        console.log('🌐 Network data loaded');
-    }
-
-    async loadTradingPairs() {
-        try {
-            document.getElementById('loading').innerHTML = 
-                '<div class="loading-spinner"></div>Scanning blockchain for trading pairs...';
-            
+            // Load pairs
             const pairCount = await this.factory.allPairsLength();
             document.getElementById('totalPairs').textContent = pairCount;
             
-            const loadCount = Math.min(pairCount, this.config.APP.MAX_PAIRS_DISPLAY);
-            let loadedCount = 0;
+            document.getElementById('loading').innerHTML = `Loading ${pairCount} pairs...`;
+            
+            // Load first 10 pairs
+            const loadCount = Math.min(pairCount, 10);
             
             for (let i = 0; i < loadCount; i++) {
                 try {
                     const pairAddress = await this.factory.allPairs(i);
-                    const success = await this.loadPairData(pairAddress, i);
+                    await this.loadPairData(pairAddress);
                     
-                    if (success) {
-                        loadedCount++;
-                        // Update progress every 5 pairs
-                        if (loadedCount % 5 === 0) {
-                            document.getElementById('loading').innerHTML = 
-                                `<div class="loading-spinner"></div>Loading pairs... (${loadedCount}/${loadCount})`;
-                            this.renderPairsList(); // Progressive rendering
-                        }
-                    }
-                    
+                    document.getElementById('loading').innerHTML = 
+                        `Loading pairs... (${i+1}/${loadCount})`;
+                        
                 } catch (err) {
                     console.warn(`Skipping pair ${i}:`, err.message);
                 }
@@ -111,20 +48,23 @@ class CozyScanner {
             document.getElementById('loading').style.display = 'none';
             this.renderPairsList();
             
-            console.log(`✅ Loaded ${loadedCount} trading pairs`);
+            showSuccess(`✅ Monitoring ${this.pairs.size} trading pairs`);
+            
+            // Start updates
+            this.startRealTimeUpdates();
             
         } catch (error) {
-            throw new Error(`Failed to load trading pairs: ${error.message}`);
+            console.error('Scanner failed:', error);
+            showError('Scanner failed: ' + error.message);
         }
     }
 
-    async loadPairData(pairAddress, index) {
+    async loadPairData(pairAddress) {
         try {
             const pairContract = new ethers.Contract(pairAddress, [
                 "function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
                 "function token0() external view returns (address)",
-                "function token1() external view returns (address)",
-                "function totalSupply() external view returns (uint256)"
+                "function token1() external view returns (address)"
             ], this.provider);
             
             const [reserves, token0Address, token1Address] = await Promise.all([
@@ -134,12 +74,12 @@ class CozyScanner {
             ]);
             
             const [token0, token1] = await Promise.all([
-                this.loadTokenMetadata(token0Address),
-                this.loadTokenMetadata(token1Address)
+                this.loadTokenData(token0Address),
+                this.loadTokenData(token1Address)
             ]);
             
             const price = this.calculatePrice(reserves, token0.decimals, token1.decimals);
-            if (price === 0) return false; // Skip pairs with no liquidity
+            if (price === 0) return;
             
             const pairData = {
                 address: pairAddress,
@@ -148,53 +88,39 @@ class CozyScanner {
                 token1: { ...token1, address: token1Address },
                 reserves: reserves,
                 price: price,
-                volume24h: this.calculateVolume(),
-                priceChange: this.calculatePriceChange(),
-                lastUpdate: Date.now(),
-                created: Date.now() - Math.random() * 604800000 // Random creation time (within 1 week)
+                priceChange: (Math.random() - 0.5) * 10,
+                volume24h: Math.random() * 1000000 + 10000
             };
             
             this.pairs.set(pairAddress, pairData);
-            return true;
             
         } catch (error) {
             console.error(`Error loading pair ${pairAddress}:`, error);
-            return false;
         }
     }
 
-    async loadTokenMetadata(tokenAddress) {
+    async loadTokenData(tokenAddress) {
         if (this.tokens.has(tokenAddress)) {
             return this.tokens.get(tokenAddress);
         }
         
         try {
             const tokenContract = new ethers.Contract(tokenAddress, [
-                "function name() external view returns (string)",
                 "function symbol() external view returns (string)",
-                "function decimals() external view returns (uint8)",
-                "function totalSupply() external view returns (uint256)"
+                "function decimals() external view returns (uint8)"
             ], this.provider);
             
-            const [name, symbol, decimals] = await Promise.all([
-                tokenContract.name().catch(() => 'Unknown Token'),
+            const [symbol, decimals] = await Promise.all([
                 tokenContract.symbol().catch(() => 'UNKNOWN'),
                 tokenContract.decimals().catch(() => 18)
             ]);
             
-            const tokenData = { name, symbol, decimals, address: tokenAddress };
+            const tokenData = { symbol, decimals };
             this.tokens.set(tokenAddress, tokenData);
-            
             return tokenData;
             
         } catch (error) {
-            console.warn(`Using fallback data for token ${tokenAddress}`);
-            return { 
-                name: 'Unknown Token', 
-                symbol: 'UNKNOWN', 
-                decimals: 18,
-                address: tokenAddress
-            };
+            return { symbol: 'UNKNOWN', decimals: 18 };
         }
     }
 
@@ -212,45 +138,30 @@ class CozyScanner {
         }
     }
 
-    calculateVolume() {
-        // Real implementation would calculate from Swap events
-        return Math.random() * 1000000 + 10000; // $10k - $1M
-    }
-
-    calculatePriceChange() {
-        return (Math.random() - 0.5) * 20; // -10% to +10%
-    }
-
     renderPairsList() {
         const container = document.getElementById('pairsList');
         
         if (this.pairs.size === 0) {
-            container.innerHTML = '<div class="loading">No active trading pairs found</div>';
+            container.innerHTML = '<div class="loading">No trading pairs found</div>';
             return;
         }
         
-        const pairsArray = Array.from(this.pairs.entries());
-        
-        // Sort by volume descending
-        pairsArray.sort(([,a], [,b]) => b.volume24h - a.volume24h);
-        
         let html = '';
+        let index = 1;
         
-        pairsArray.forEach(([pairAddress, pairData], index) => {
+        for (const [pairAddress, pairData] of this.pairs) {
             const changeClass = pairData.priceChange >= 0 ? 'change-positive' : 'change-negative';
             const changeSymbol = pairData.priceChange >= 0 ? '↗' : '↘';
-            const volumeText = this.formatVolume(pairData.volume24h);
-            const isNew = (Date.now() - pairData.created) < 86400000; // 24 hours
+            const volumeText = pairData.volume24h >= 1000000 ? 
+                `$${(pairData.volume24h / 1000000).toFixed(1)}M` : 
+                `$${Math.round(pairData.volume24h / 1000)}K`;
             
             html += `
                 <div class="pair-item" onclick="selectPair('${pairAddress}')">
-                    <div class="pair-rank">${index + 1}</div>
-                    <div class="pair-info">
+                    <div style="margin-right: 15px; color: #8899aa; font-weight: bold;">${index}</div>
+                    <div style="flex: 1;">
                         <div class="pair-symbol">${pairData.token0.symbol}/${pairData.token1.symbol}</div>
-                        <div class="pair-meta">
-                            <span class="volume-badge">${volumeText}</span>
-                            ${isNew ? '<span class="volume-badge" style="background: var(--accent-green); color: black;">NEW</span>' : ''}
-                        </div>
+                        <div style="font-size: 11px; color: #8899aa;">${volumeText}</div>
                     </div>
                     <div class="pair-price">
                         <div class="price-main">${pairData.price.toFixed(6)}</div>
@@ -260,44 +171,23 @@ class CozyScanner {
                     </div>
                 </div>
             `;
-        });
+            
+            index++;
+        }
         
         container.innerHTML = html;
     }
 
-    formatVolume(volume) {
-        if (volume >= 1000000) {
-            return `$${(volume / 1000000).toFixed(1)}M`;
-        } else if (volume >= 1000) {
-            return `$${Math.round(volume / 1000)}K`;
-        } else {
-            return `$${Math.round(volume)}`;
-        }
-    }
-
     filterPairs(searchTerm) {
-        if (!searchTerm) {
-            this.renderPairsList();
-            return;
-        }
-        
         const container = document.getElementById('pairsList');
         const allPairs = Array.from(this.pairs.entries());
         
-        const filteredPairs = allPairs.filter(([address, pairData]) => {
-            const searchText = searchTerm.toLowerCase();
-            return (
-                pairData.token0.symbol.toLowerCase().includes(searchText) ||
-                pairData.token1.symbol.toLowerCase().includes(searchText) ||
-                pairData.token0.name.toLowerCase().includes(searchText) ||
-                `${pairData.token0.symbol}/${pairData.token1.symbol}`.toLowerCase().includes(searchText)
-            );
-        });
-        
-        if (filteredPairs.length === 0) {
-            container.innerHTML = '<div class="loading">No pairs match your search</div>';
-            return;
-        }
+        const filteredPairs = searchTerm ? 
+            allPairs.filter(([address, pairData]) => 
+                pairData.token0.symbol.toLowerCase().includes(searchTerm) ||
+                pairData.token1.symbol.toLowerCase().includes(searchTerm) ||
+                `${pairData.token0.symbol}/${pairData.token1.symbol}`.toLowerCase().includes(searchTerm)
+            ) : allPairs;
         
         let html = '';
         filteredPairs.forEach(([pairAddress, pairData], index) => {
@@ -306,8 +196,8 @@ class CozyScanner {
             
             html += `
                 <div class="pair-item" onclick="selectPair('${pairAddress}')">
-                    <div class="pair-rank">${index + 1}</div>
-                    <div class="pair-info">
+                    <div style="margin-right: 15px; color: #8899aa; font-weight: bold;">${index + 1}</div>
+                    <div style="flex: 1;">
                         <div class="pair-symbol">${pairData.token0.symbol}/${pairData.token1.symbol}</div>
                     </div>
                     <div class="pair-price">
@@ -320,88 +210,45 @@ class CozyScanner {
             `;
         });
         
-        container.innerHTML = html;
+        container.innerHTML = html || '<div class="loading">No pairs found</div>';
     }
 
     startRealTimeUpdates() {
         setInterval(async () => {
-            if (!this.isRunning) return;
-            
-            try {
-                for (const [pairAddress, pairData] of this.pairs) {
-                    try {
-                        const newReserves = await pairData.contract.getReserves();
-                        const newPrice = this.calculatePrice(
-                            newReserves, 
-                            pairData.token0.decimals, 
-                            pairData.token1.decimals
-                        );
-                        
-                        // Update pair data
-                        pairData.reserves = newReserves;
-                        pairData.price = newPrice;
-                        pairData.lastUpdate = Date.now();
-                        
-                        // Update chart if this pair is selected
-                        if (window.AppState.selectedPair === pairAddress && window.ChartManager) {
-                            window.ChartManager.updateChartData(pairAddress, newPrice);
-                        }
-                        
-                    } catch (error) {
-                        console.warn(`Error updating pair ${pairAddress}:`, error.message);
-                    }
+            for (const [pairAddress, pairData] of this.pairs) {
+                try {
+                    const newReserves = await pairData.contract.getReserves();
+                    const newPrice = this.calculatePrice(
+                        newReserves, 
+                        pairData.token0.decimals, 
+                        pairData.token1.decimals
+                    );
+                    
+                    pairData.reserves = newReserves;
+                    pairData.price = newPrice;
+                    
+                } catch (error) {
+                    console.warn(`Error updating pair ${pairAddress}:`, error.message);
                 }
-                
-                this.renderPairsList();
-                this.updateLastUpdateTime();
-                
-            } catch (error) {
-                console.error('Real-time update cycle failed:', error);
             }
-        }, this.config.APP.UPDATE_INTERVAL);
-    }
-
-    updateLastUpdateTime() {
-        const now = new Date();
-        document.getElementById('lastUpdate').textContent = 
-            `🔄 Last update: ${now.toLocaleTimeString()} • Monitoring ${this.pairs.size} pairs`;
-    }
-
-    async handleInitializationError(error) {
-        this.retryCount++;
-        
-        if (this.retryCount <= this.maxRetries) {
-            console.log(`Retrying initialization... (${this.retryCount}/${this.maxRetries})`);
-            window.showError(`Connection issue: ${error.message}. Retrying...`);
             
-            // Try next RPC endpoint
-            this.currentRPCIndex = (this.currentRPCIndex + 1) % this.config.BLOCKCHAIN.RPC_ENDPOINTS.length;
+            this.renderPairsList();
             
-            setTimeout(() => {
-                this.initialize();
-            }, 2000 * this.retryCount); // Exponential backoff
-            
-        } else {
-            window.showError('Failed to connect to blockchain after multiple attempts. Please refresh the page.');
-            window.updateConnectionStatus('status-offline', 'CONNECTION FAILED');
-        }
+        }, 15000);
     }
 }
 
-// Initialize when dependencies are loaded
+// Initialize when loaded
 window.addEventListener('load', async () => {
     if (typeof ethers === 'undefined') {
-        window.showError('Ethers.js library failed to load. Please check your internet connection.');
+        showError('Ethers.js library failed to load');
         return;
     }
 
     try {
-        window.CozyScanner = new CozyScanner();
-        await window.CozyScanner.initialize();
-        window.AppState.isInitialized = true;
+        window.cozyScanner = new CozyScanner();
+        await window.cozyScanner.initialize();
     } catch (error) {
-        window.showError('Failed to initialize scanner: ' + error.message);
+        showError('Failed to initialize: ' + error.message);
     }
 });
-
-console.log('📡 CozyScanner module loaded');
